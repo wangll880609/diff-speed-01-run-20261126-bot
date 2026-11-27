@@ -32,38 +32,38 @@ const DELETE = '-';
 const INSERT = '+';
 
 /**
- * A text's lines (each with its "\n", the last one without when the text
- * does not end in one) and their interned ids, in order. `intern` is shared
- * by both texts so equal lines get equal ids across them.
+ * A text's lines and their interned ids, in order. `parts` are the text's
+ * pieces between "\n"s (no newline attached); the last piece is the text's
+ * last line, without a newline, when it is non-empty, else there is no last
+ * line. `intern` is shared by both texts so equal lines get equal ids
+ * across them; a bare last line takes its part's id with FLAG set, since
+ * "x" (no newline) is a different line from "x\n".
  */
+const FLAG = 1 << 30;
+
 function tokenize(text, intern) {
   const parts = text.split('\n');
   const last = parts.length - 1;
   const hasLast = parts[last] !== '';
   const count = last + (hasLast ? 1 : 0);
-  const lines = new Array(count);
   const ids = new Int32Array(count);
   for (let i = 0; i < last; i++) {
-    const line = parts[i] + '\n';
-    lines[i] = line;
-    let id = intern.get(line);
+    let id = intern.get(parts[i]);
     if (id === undefined) {
       id = intern.size;
-      intern.set(line, id);
+      intern.set(parts[i], id);
     }
     ids[i] = id;
   }
   if (hasLast) {
-    const line = parts[last];
-    lines[last] = line;
-    let id = intern.get(line);
+    let id = intern.get(parts[last]);
     if (id === undefined) {
       id = intern.size;
-      intern.set(line, id);
+      intern.set(parts[last], id);
     }
-    ids[last] = id;
+    ids[last] = id | FLAG;
   }
-  return { lines, ids };
+  return { parts, ids, bare: hasLast ? last : -1 };
 }
 
 /**
@@ -74,27 +74,32 @@ function tokenize(text, intern) {
  * whenever it reaches at least as far into the old text, and a candidate
  * that would move past the end of its text is not a candidate at all.
  *
- * The trace is one flat Int32Array: distance d starts at off(d) = d*d + 2*d
- * and holds 2d+3 entries, index k+d+1. Each entry stores x+1 (the old lines
- * consumed after the snake), 0 where the diagonal holds no path, so a fresh
- * zero-filled buffer needs no per-distance fill.
+ * The trace is one flat Int32Array, reused across cases: distance d starts
+ * at off(d) = d*d + 2*d and holds 2d+3 entries, index k+d+1. Each entry
+ * stores x+1 (the old lines consumed after the snake), 0 where the diagonal
+ * holds no path, so a zero-filled buffer needs no per-distance fill; the
+ * used region is zeroed again after each case so a stale entry can never
+ * read as a path.
  */
+const TRACE_CAP_D = 4608;
+const off = (d) => d * d + 2 * d;
+let traceBuf = new Int32Array(off(TRACE_CAP_D + 1));
+let traceCap = off(TRACE_CAP_D + 1);
+
 function editRuns(A, B) {
   const N = A.length;
   const M = B.length;
-  const off = (d) => d * d + 2 * d;
-  // Room for D = 4096 (about 16.8M entries); doubled if a longer search needs it.
-  let cap = off(4097);
-  let T = new Int32Array(cap);
+  let T = traceBuf;
   const ensure = (need) => {
-    if (need <= cap) return;
+    if (need <= traceCap) return;
     if (need > off(8192)) throw new Error(`makefun-diff: search exceeded D=8192 (need ${need} trace entries)`);
-    let ncap = cap;
+    let ncap = traceCap;
     while (ncap < need) ncap *= 2;
     const nT = new Int32Array(ncap);
     nT.set(T);
     T = nT;
-    cap = ncap;
+    traceBuf = nT;
+    traceCap = ncap;
   };
   // d = 0: diagonal 0, index 1.
   let x = 0;
@@ -104,7 +109,10 @@ function editRuns(A, B) {
     y++;
   }
   T[1] = x + 1;
-  if (x >= N && y >= M) return { runs: x > 0 ? [{ kind: KEEP, count: x }] : [], trace: T, D: 0 };
+  if (x >= N && y >= M) {
+    T.fill(0, 0, 3);
+    return { runs: x > 0 ? [{ kind: KEEP, count: x }] : [], D: 0 };
+  }
 
   let D = -1;
   let kEnd = 0;
@@ -143,6 +151,7 @@ function editRuns(A, B) {
     if (done) break;
   }
   if (D === -1) throw new Error('makefun-diff: the search ended without reaching both ends');
+  const used = off(D + 1);
 
   // Backtrack: the forward choice at (d, k) is a deterministic function of
   // V[d-1], so replaying it from the trace gives the exact path taken.
@@ -164,6 +173,7 @@ function editRuns(A, B) {
     k = prevK;
   }
   steps[0] = { edit: null, keep: T[1] - 1 };
+  T.fill(0, 0, used);
 
   // Forward runs, merging consecutive edits of one kind across an empty keep.
   const runs = [];
@@ -178,12 +188,12 @@ function editRuns(A, B) {
     push(steps[d].edit, 1);
     push(KEEP, steps[d].keep);
   }
-  return { runs, trace: T, D };
+  return { runs, D };
 }
 
-/** A line as the patch writes it: its op, the line, a newline, and "%" on a line of its own when it had none. */
-function written(op, line) {
-  return line.endsWith('\n') ? `${op}${line}` : `${op}${line}\n%\n`;
+/** A line as the patch writes it: its op, the line, a newline, and "%" on a line of its own when it had none (bare). */
+function written(op, part, bare) {
+  return bare ? `${op}${part}\n%\n` : `${op}${part}\n`;
 }
 
 /** makefun-diff 1.0.0's answer for one case's input, computed faster. */
@@ -191,8 +201,8 @@ function diffPatch(oldText, newText) {
   const intern = new Map();
   const a = tokenize(oldText, intern);
   const b = tokenize(newText, intern);
-  const n = a.lines.length;
-  const m = b.lines.length;
+  const n = a.ids.length;
+  const m = b.ids.length;
   const A = a.ids;
   const B = b.ids;
   // The common prefix, then the common suffix of what is left.
@@ -253,12 +263,12 @@ function diffPatch(oldText, newText) {
     out.push(`@ ${oldStart + 1} ${oldEnd - oldStart} ${newStart + 1} ${newEnd - newStart}\n`);
     let at = oldStart;
     for (const c of h) {
-      for (; at < c.o; at++) out.push(written(KEEP, a.lines[at]));
-      for (let i = 0; i < c.dels; i++) out.push(written(DELETE, a.lines[c.o + i]));
-      for (let i = 0; i < c.ins; i++) out.push(written(INSERT, b.lines[c.p + i]));
+      for (; at < c.o; at++) out.push(written(KEEP, a.parts[at], at === a.bare));
+      for (let i = 0; i < c.dels; i++) out.push(written(DELETE, a.parts[c.o + i], c.o + i === a.bare));
+      for (let i = 0; i < c.ins; i++) out.push(written(INSERT, b.parts[c.p + i], c.p + i === b.bare));
       at = c.o + c.dels;
     }
-    for (; at < oldEnd; at++) out.push(written(KEEP, a.lines[at]));
+    for (; at < oldEnd; at++) out.push(written(KEEP, a.parts[at], at === a.bare));
   }
   return out.join('');
 }
